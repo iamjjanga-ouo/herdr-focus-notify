@@ -127,6 +127,13 @@ fn alerter_focus_script(
         .as_deref()
         .map(|subtitle| alerter_text_arg("subtitle", subtitle))
         .unwrap_or_default();
+    // alerter only sees notifications of the sender they were posted as, so
+    // the monitor's --remove names it too.
+    let sender_args = notification
+        .sender
+        .as_ref()
+        .map(|sender| format!(" --sender {}", shell_quote(sender)))
+        .unwrap_or_default();
     let timeout_args = if timeout_secs > 0 {
         format!(" --timeout {}", timeout_secs)
     } else {
@@ -148,7 +155,7 @@ fn alerter_focus_script(
         cleared_marker = cleared_marker_q
     ));
     script.push_str(&format!(
-        "result_path=$(mktemp {result_template}) || exit 1\nstatus_path=$(mktemp {status_template}) || {{ rm -f \"$result_path\"; exit 1; }}\nmonitor_pid=\ncleanup() {{\n  [ -z \"$monitor_pid\" ] || kill \"$monitor_pid\" 2>/dev/null\n  rm -f \"$result_path\" \"$status_path\"\n}}\ntrap cleanup EXIT\n(\n  {notifier}{title_arg}{message_arg}{subtitle_arg} --group {group}{app_icon_args} --actions {action} --close-label {close_label}{timeout_args} > \"$result_path\" 2>/dev/null\n  printf '%s' \"$?\" > \"$status_path\"\n) &\nnotifier_pid=$!\n",
+        "result_path=$(mktemp {result_template}) || exit 1\nstatus_path=$(mktemp {status_template}) || {{ rm -f \"$result_path\"; exit 1; }}\nmonitor_pid=\ncleanup() {{\n  [ -z \"$monitor_pid\" ] || kill \"$monitor_pid\" 2>/dev/null\n  rm -f \"$result_path\" \"$status_path\"\n}}\ntrap cleanup EXIT\n(\n  {notifier}{title_arg}{message_arg}{subtitle_arg} --group {group}{app_icon_args}{sender_args} --actions {action} --close-label {close_label}{timeout_args} > \"$result_path\" 2>/dev/null\n  printf '%s' \"$?\" > \"$status_path\"\n) &\nnotifier_pid=$!\n",
         result_template = result_template_q,
         status_template = status_template_q,
         notifier = notifier_q,
@@ -157,16 +164,18 @@ fn alerter_focus_script(
         subtitle_arg = subtitle_arg,
         group = group_q,
         app_icon_args = app_icon_args,
+        sender_args = sender_args,
         action = shell_quote("Focus"),
         close_label = shell_quote("Dismiss"),
         timeout_args = timeout_args,
     ));
     if let Some(ref visibility_check_command) = visibility_check_command {
         script.push_str(&format!(
-            "(\n  while kill -0 \"$notifier_pid\" 2>/dev/null; do\n    sleep 2\n    kill -0 \"$notifier_pid\" 2>/dev/null || exit 0\n    if {visibility_check} >/dev/null 2>&1 && {notifier} --remove {group} >/dev/null 2>&1; then\n      exit 0\n    fi\n  done\n) &\nmonitor_pid=$!\n",
+            "(\n  while kill -0 \"$notifier_pid\" 2>/dev/null; do\n    sleep 2\n    kill -0 \"$notifier_pid\" 2>/dev/null || exit 0\n    if {visibility_check} >/dev/null 2>&1 && {notifier} --remove {group}{sender_args} >/dev/null 2>&1; then\n      exit 0\n    fi\n  done\n) &\nmonitor_pid=$!\n",
             visibility_check = visibility_check_command,
             notifier = notifier_q,
             group = group_q,
+            sender_args = sender_args,
         ));
     }
     script.push_str("wait \"$notifier_pid\"\n");
@@ -266,7 +275,37 @@ mod tests {
             subtitle: Some("Codex".to_string()),
             group: "herdr-w1-p3".to_string(),
             app_icon: Some("/tmp/codex icon.png".to_string()),
+            sender: None,
         }
+    }
+
+    #[test]
+    fn alerter_script_passes_sender() {
+        let notification = FocusNotification {
+            sender: Some("local.herdr.focus-notify".to_string()),
+            ..sample_notification()
+        };
+        let script = alerter_focus_script(
+            &notification,
+            "/usr/local/bin/herdr",
+            "/opt/homebrew/bin/alerter",
+            120,
+            Some(Path::new("/tmp/herdr-focus-notify")),
+            Path::new("/tmp/herdr-focus-notify"),
+        );
+
+        assert!(script.contains("--sender 'local.herdr.focus-notify' --actions"));
+        assert!(script.contains("--remove 'herdr-w1-p3' --sender 'local.herdr.focus-notify'"));
+
+        let plain = alerter_focus_script(
+            &sample_notification(),
+            "/usr/local/bin/herdr",
+            "/opt/homebrew/bin/alerter",
+            120,
+            None,
+            Path::new("/tmp/herdr-focus-notify"),
+        );
+        assert!(!plain.contains("--sender"));
     }
 
     #[test]

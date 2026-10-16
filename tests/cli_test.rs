@@ -75,7 +75,8 @@ fn focus_event_removes_notification_for_foreground_terminal() {
         )
         .env("HERDR_PLUGIN_STATE_DIR", temp_dir.join("state"))
         .env("NOTIFIER_LOG", &notifier_log)
-        .env("PATH", path)
+        .env("PATH", &path)
+        .env("HOME", &temp_dir)
         .output()
         .unwrap();
 
@@ -83,6 +84,28 @@ fn focus_event_removes_notification_for_foreground_terminal() {
     assert_eq!(
         fs::read_to_string(&notifier_log).unwrap(),
         "--remove\nherdr-w1-p2\n"
+    );
+
+    // Once the stub Herdr.app is installed, notifications are posted as it,
+    // and alerter only finds them again under the same sender.
+    fs::create_dir_all(temp_dir.join("Applications/Herdr.app")).unwrap();
+    let output = binary()
+        .env("HERDR_PLUGIN_EVENT", "pane.focused")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane.focused","data":{"pane_id":"w1:p2"}}"#,
+        )
+        .env("HERDR_PLUGIN_STATE_DIR", temp_dir.join("state"))
+        .env("NOTIFIER_LOG", &notifier_log)
+        .env("PATH", &path)
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&notifier_log).unwrap(),
+        "--remove\nherdr-w1-p2\n--sender\nlocal.herdr.focus-notify\n"
     );
     fs::remove_dir_all(temp_dir).unwrap();
 }
@@ -280,10 +303,9 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     // log into place, so the file appears only once all arguments are written.
     let notifier_output = wait_for_notifier_output(&notifier_log);
 
-    assert!(notifier_output.contains("Blocked · sample-repo · status"));
-    // The pane's terminal title is the message; the event's own title is not
-    // shown next to it.
-    assert!(notifier_output.contains("Tidy up the parser tests"));
+    assert!(notifier_output.contains("✋ [codex] - Tidy up the parser tests"));
+    // The pane's terminal title names the session in the title; the event's
+    // own title is not shown next to it.
     assert!(!notifier_output.contains("Implement plugin"));
     assert!(notifier_output.contains("--subtitle"));
     // The pane sits in a linked worktree, so the branch is that worktree's,
@@ -348,7 +370,7 @@ fn a_hanging_worktree_lookup_delays_the_notification_by_the_budget_at_most() {
 
     // What answered in time is still shown; the branch is dropped, and with it
     // the git probe, which has no branch to attribute changes to.
-    assert!(notifier_output.contains("Blocked · sample-repo · status"));
+    assert!(notifier_output.contains("✋ [codex] - Tidy up the parser tests"));
     assert!(notifier_output.contains("Tidy up the parser tests"));
     assert!(
         notifier_output.contains("--subtitle=Codex\n"),

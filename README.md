@@ -6,6 +6,12 @@ English | [简体中文](README.zh-CN.md)
 
 It is designed to notify you only when the change is easy to miss: when Herdr is not frontmost, or when you are looking at a different pane.
 
+## Changes in this fork
+
+- **Session-named notifications.** When the pane has a terminal title, which Claude Code sets to the session's title, the notification title reads `🏁 [claude] - <session name>`, or `✋` while the agent waits for you. 🏁 marks a finished turn, not a successful one. For a finished Claude Code turn, the message is the first line of Claude's closing message, read from the session transcript. The subtitle keeps the agent and git state.
+- **"Herdr" as the sender.** Run `scripts/install-herdr-app.sh` once to register a stub `~/Applications/Herdr.app`; notifications then say "Herdr" instead of "Terminal". Delete the app to go back.
+- **Ghostty quick terminal.** When Ghostty has no regular window, a click shows the quick terminal if it is hidden and gives it keyboard focus, instead of `open -b`, which would open a new Ghostty window.
+
 ## Herdr compatibility
 
 For **Herdr 0.9.0, use plugin tag `v0.5.0` or later**. The `v0.4.0` tag predates the client focus changes: clicking a notification may activate the terminal without switching to the target pane. Later versions explicitly project the target pane into attached client views.
