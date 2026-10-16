@@ -7,6 +7,7 @@ mod icons;
 mod notification;
 mod notifier;
 mod script;
+mod session;
 mod state;
 mod terminal;
 mod util;
@@ -25,7 +26,7 @@ use focus::{
     frontmost_bundle_id, learn_terminal_from_frontmost, notification_decision, pane_details,
     pane_labels, should_clear_notification_on_focus, test_notification, NotificationDecision,
 };
-use notifier::{remove_notification, resolve_notifier_bin, send_notification};
+use notifier::{herdr_sender, remove_notification, resolve_notifier_bin, send_notification};
 use script::{rewrite_generated_scripts_without_activation, write_focus_script};
 use state::{
     cleanup_stale_state_files, clear_terminal_bindings, mark_notification_cleared,
@@ -181,6 +182,7 @@ fn run() -> Result<(), String> {
         let labels = pane_labels(&notification.pane_id, details, &herdr_bin, deadline);
         enrich_notification(&mut notification, &labels);
     }
+    notification.sender = herdr_sender();
 
     reset_notification_clearance(&notification.pane_id)
         .map_err(|err| format!("failed to reset notification clearance: {err}"))?;

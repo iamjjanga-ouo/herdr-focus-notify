@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::icons::agent_icon_path;
 use crate::notification::{FocusNotification, PaneLabels};
+use crate::session::session_title;
 use crate::util::notification_group_id;
 
 #[derive(Debug, Deserialize)]
@@ -71,12 +72,12 @@ pub(crate) fn notification_from_event_json(
             .map(String::as_str),
     ]);
 
-    let (title, fallback_body) = match status.as_str() {
-        "blocked" => ("Blocked", "Open the pane to review and respond."),
-        "done" => ("Done", "Open the pane to review the result."),
+    let title = match status.as_str() {
+        "blocked" => "Blocked",
+        "done" => "Done",
         _ => unreachable!("status already filtered"),
     };
-    let body = detail.unwrap_or(fallback_body).to_string();
+    let body = detail.unwrap_or(fallback_body(&status)).to_string();
     let group = notification_group_id(&pane_id);
 
     Ok(Some(FocusNotification {
@@ -87,7 +88,16 @@ pub(crate) fn notification_from_event_json(
         subtitle: Some(agent),
         group,
         app_icon,
+        sender: None,
     }))
+}
+
+fn fallback_body(status: &str) -> &'static str {
+    if status == "done" {
+        "Open the pane to review the result."
+    } else {
+        "Open the pane to review and respond."
+    }
 }
 
 pub(crate) fn focused_pane_id_from_event_json(json: &str) -> Result<Option<String>, String> {
@@ -105,18 +115,33 @@ fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<&str> {
     values.into_iter().find_map(trimmed)
 }
 
-/// Lays the notification out like the Agent sidebar's own rows: state, then
-/// workspace and tab in the title, the agent (and the pane's git state) in the
-/// subtitle, and the pane's title as the message. Every input is optional, so a
-/// failed `herdr` call, or a pane Herdr cannot describe, leaves the event-only
-/// message in place.
+/// Titles a named session `🏁 [claude] - <session name>` (`✋` while blocked);
+/// a pane without one keeps the sidebar's state, workspace and tab. The agent
+/// and the pane's git state go in the subtitle. Under a session title the
+/// message is a finished turn's summary, else the status copy: the event's own
+/// message is that same terminal title. Every input is optional, so a failed
+/// `herdr` call, or a pane Herdr cannot describe, leaves the event-only message
+/// in place.
 pub(crate) fn enrich_notification(notification: &mut FocusNotification, labels: &PaneLabels) {
-    for extra in [&labels.workspace, &labels.tab]
-        .into_iter()
-        .filter_map(|label| trimmed(label.as_deref()))
-    {
-        notification.title.push_str(" · ");
-        notification.title.push_str(extra);
+    let session = trimmed(labels.terminal_title.as_deref());
+    match session {
+        Some(session) => {
+            // The event's agent, already in the subtitle, stands in for Herdr's.
+            let agent = trimmed(labels.agent.as_deref())
+                .map(str::to_string)
+                .or_else(|| notification.subtitle.as_deref().map(str::to_lowercase))
+                .unwrap_or_else(|| "agent".to_string());
+            notification.title = session_title(&notification.status, &agent, session);
+        }
+        None => {
+            for extra in [&labels.workspace, &labels.tab]
+                .into_iter()
+                .filter_map(|label| trimmed(label.as_deref()))
+            {
+                notification.title.push_str(" · ");
+                notification.title.push_str(extra);
+            }
+        }
     }
 
     // The event already put the agent in the subtitle; the git state joins it.
@@ -130,8 +155,11 @@ pub(crate) fn enrich_notification(notification: &mut FocusNotification, labels: 
         }
     }
 
-    if let Some(task) = trimmed(labels.terminal_title.as_deref()) {
-        notification.body = task.to_string();
+    if session.is_some() {
+        let summary = trimmed(labels.summary.as_deref()).filter(|_| notification.status == "done");
+        notification.body = summary
+            .unwrap_or(fallback_body(&notification.status))
+            .to_string();
     }
 }
 
@@ -225,7 +253,66 @@ mod tests {
     }
 
     #[test]
-    fn enrichment_lays_out_title_subtitle_and_message_like_the_sidebar() {
+    fn enrichment_titles_a_named_session_and_keeps_git_in_the_subtitle() {
+        let json = r#"{
+            "data": {
+                "pane_id": "w1:p3",
+                "agent_status": "blocked",
+                "agent": "Codex",
+                "title": "Tidy up the parser tests"
+            }
+        }"#;
+        let mut notification = notification_from_event_json(json).unwrap().unwrap();
+
+        enrich_notification(
+            &mut notification,
+            &PaneLabels {
+                workspace: Some(" sample-repo ".to_string()),
+                tab: Some("status".to_string()),
+                terminal_title: Some("Tidy up the parser tests".to_string()),
+                agent: Some("codex".to_string()),
+                git: Some("main* +120/-45".to_string()),
+                ..PaneLabels::default()
+            },
+        );
+
+        assert_eq!(notification.title, "✋ [codex] - Tidy up the parser tests");
+        assert_eq!(
+            notification.subtitle.as_deref(),
+            Some("Codex · main* +120/-45")
+        );
+        // The event's message was the session name, which the title now holds.
+        assert_eq!(notification.body, "Open the pane to review and respond.");
+    }
+
+    #[test]
+    fn enrichment_shows_a_finished_turns_summary() {
+        let json = r#"{
+            "data": {
+                "pane_id": "w1:p3",
+                "agent_status": "done",
+                "agent": "claude",
+                "display_agent": "Claude"
+            }
+        }"#;
+        let mut notification = notification_from_event_json(json).unwrap().unwrap();
+
+        enrich_notification(
+            &mut notification,
+            &PaneLabels {
+                terminal_title: Some("Fix the parser".to_string()),
+                agent: Some("claude".to_string()),
+                summary: Some("Fixed the parser.".to_string()),
+                ..PaneLabels::default()
+            },
+        );
+
+        assert_eq!(notification.title, "🏁 [claude] - Fix the parser");
+        assert_eq!(notification.body, "Fixed the parser.");
+    }
+
+    #[test]
+    fn enrichment_without_a_session_name_keeps_the_sidebar_title() {
         let json = r#"{
             "data": {
                 "pane_id": "w1:p3",
@@ -240,17 +327,14 @@ mod tests {
             &PaneLabels {
                 workspace: Some(" sample-repo ".to_string()),
                 tab: Some("status".to_string()),
-                terminal_title: Some("Tidy up the parser tests".to_string()),
-                git: Some("main* +120/-45".to_string()),
+                // A blocked pane's summary is not what it is waiting for.
+                summary: Some("Earlier answer.".to_string()),
+                ..PaneLabels::default()
             },
         );
 
         assert_eq!(notification.title, "Blocked · sample-repo · status");
-        assert_eq!(
-            notification.subtitle.as_deref(),
-            Some("Codex · main* +120/-45")
-        );
-        assert_eq!(notification.body, "Tidy up the parser tests");
+        assert_eq!(notification.body, "Open the pane to review and respond.");
     }
 
     #[test]

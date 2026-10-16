@@ -12,6 +12,18 @@ pub(crate) fn resolve_notifier_bin() -> Result<String, String> {
     })
 }
 
+/// Bundle id of the stub `Herdr.app` that `scripts/install-herdr-app.sh`
+/// registers, so notifications say "Herdr" instead of alerter's default
+/// sender, Terminal.
+const HERDR_APP_BUNDLE_ID: &str = "local.herdr.focus-notify";
+
+/// alerter's `--sender`: the stub `Herdr.app` once installed, else `None` for
+/// alerter's default.
+pub(crate) fn herdr_sender() -> Option<String> {
+    let app = home_dir()?.join("Applications/Herdr.app");
+    app.is_dir().then(|| HERDR_APP_BUNDLE_ID.to_string())
+}
+
 pub(crate) fn send_notification(script_path: &Path, foreground: bool) -> io::Result<()> {
     if foreground {
         run_script_foreground(script_path)
@@ -23,11 +35,12 @@ pub(crate) fn send_notification(script_path: &Path, foreground: bool) -> io::Res
 pub(crate) fn remove_notification(pane_id: &str, notifier_bin: &str) -> io::Result<()> {
     let group = notification_group_id(pane_id);
 
-    match Command::new(notifier_bin)
-        .arg("--remove")
-        .arg(group)
-        .status()
-    {
+    let mut command = Command::new(notifier_bin);
+    command.arg("--remove").arg(group);
+    if let Some(sender) = herdr_sender() {
+        command.arg("--sender").arg(sender);
+    }
+    match command.status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(io::Error::other(format!(
             "notification removal exited with {status}"

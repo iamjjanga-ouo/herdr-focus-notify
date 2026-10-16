@@ -44,6 +44,14 @@ struct AgentInfo {
     cwd: Option<String>,
     tab_id: Option<String>,
     terminal_title_stripped: Option<String>,
+    agent: Option<String>,
+    agent_session: Option<AgentSession>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSession {
+    kind: Option<String>,
+    value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +107,7 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
         subtitle: None,
         group: format!("herdr-{}", sanitize_group_id(&pane_id)),
         app_icon: None,
+        sender: None,
     }
 }
 
@@ -112,6 +121,9 @@ pub(crate) struct PaneDetails {
     cwd: Option<String>,
     tab_id: Option<String>,
     terminal_title: Option<String>,
+    agent: Option<String>,
+    /// The Claude Code session id, for a Claude Code pane.
+    claude_session_id: Option<String>,
 }
 
 /// One `herdr agent get`, so the decision to notify at all and the
@@ -151,10 +163,17 @@ pub(crate) fn pane_labels(
         ))
     });
 
+    let summary = details
+        .claude_session_id
+        .as_deref()
+        .and_then(crate::session::claude_turn_summary);
+
     PaneLabels {
         workspace,
         tab,
         terminal_title: details.terminal_title,
+        agent: details.agent,
+        summary,
         git,
     }
 }
@@ -232,11 +251,22 @@ fn pane_details_from_get_json(json: &str, expected_pane_id: &str) -> Option<Pane
         // it applies then: not its focus, and not its directory, tab or title,
         // which would name another pane on a notification that focuses this one.
         .filter(|agent| agent.pane_id.as_deref() == Some(expected_pane_id))
-        .map(|agent| PaneDetails {
-            focused: agent.focused,
-            cwd: agent.cwd,
-            tab_id: agent.tab_id,
-            terminal_title: agent.terminal_title_stripped,
+        .map(|agent| {
+            let claude_session_id = agent
+                .agent_session
+                .filter(|session| {
+                    agent.agent.as_deref() == Some("claude")
+                        && session.kind.as_deref() == Some("id")
+                })
+                .and_then(|session| session.value);
+            PaneDetails {
+                focused: agent.focused,
+                cwd: agent.cwd,
+                tab_id: agent.tab_id,
+                terminal_title: agent.terminal_title_stripped,
+                agent: agent.agent,
+                claude_session_id,
+            }
         })
 }
 
@@ -277,10 +307,16 @@ pub(crate) fn focus_pane(pane_id: &str) -> Result<(), String> {
         // terminal, so it brings that container forward. Terminals without an
         // adapter, or any failure, keep plain app activation.
         let socket_path = env::var("HERDR_SOCKET_PATH").ok();
-        if let Some(socket_path) = &socket_path {
-            let _ = crate::terminal::raise_client_container(&bound_terminal, socket_path);
+        // Ghostty's quick terminal is activated on its own, and `open -b`
+        // runs only when there is none: it would open a new window.
+        let open_terminal = bound_terminal != crate::terminal::GHOSTTY_BUNDLE_ID
+            || crate::terminal::raise_quick_terminal() == crate::terminal::QuickTerminal::Absent;
+        if open_terminal {
+            if let Some(socket_path) = &socket_path {
+                let _ = crate::terminal::raise_client_container(&bound_terminal, socket_path);
+            }
+            activate_terminal(&bound_terminal)?;
         }
-        activate_terminal(&bound_terminal)?;
         let socket_path = socket_path.ok_or("HERDR_SOCKET_PATH is unavailable")?;
         focus_pane_via_socket(pane_id, &socket_path)
     })();

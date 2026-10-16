@@ -13,6 +13,7 @@
 //! the caller's app-level activation unchanged.
 
 mod client;
+mod ghostty;
 mod iterm2;
 mod kitty;
 
@@ -23,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) use client::HerdrClient;
+pub(crate) use ghostty::{raise_quick_terminal, QuickTerminal, BUNDLE_ID as GHOSTTY_BUNDLE_ID};
 
 /// A terminal that can focus the container running a given Herdr client.
 pub(crate) trait TerminalAdapter: Sync {
