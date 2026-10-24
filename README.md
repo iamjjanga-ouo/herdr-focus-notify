@@ -11,6 +11,7 @@ It is designed to notify you only when the change is easy to miss: when Herdr is
 - **Session-named notifications.** When the pane has a terminal title, which Claude Code sets to the session's title, the notification title reads `🏁 [claude] - <session name>`, or `✋` while the agent waits for you. 🏁 marks a finished turn, not a successful one. For a finished Claude Code turn, the message is the first line of Claude's closing message, read from the session transcript. The subtitle keeps the agent and git state.
 - **"Herdr" as the sender.** Run `scripts/install-herdr-app.sh` once to register a stub `~/Applications/Herdr.app`; notifications then say "Herdr" instead of "Terminal". Delete the app to go back.
 - **Ghostty quick terminal.** When Ghostty has no regular window, a click shows the quick terminal if it is hidden and gives it keyboard focus, instead of `open -b`, which would open a new Ghostty window.
+- **Remote machines.** A watcher on the Mac notifies about the agents of a saved SSH machine as well. See [Remote machines](#remote-machines).
 
 ## Herdr compatibility
 
@@ -102,6 +103,31 @@ If the pane was already active when the notification arrived, returning to that 
 
 The `--test` action sends a real test notification (capped at 10 seconds) so you can verify the whole pipeline.
 
+## Remote machines
+
+Herdr runs a plugin's event hooks on the server that hosts the panes. The agents of a saved SSH machine (`herdr machine add`) therefore never reach the plugin on your Mac, even though the Herdr client shows them. A watcher on the Mac covers them instead. Nothing is installed on the machine.
+
+Run this from the checkout Herdr builds the plugin from, with the machine's label:
+
+```bash
+cargo build --release
+scripts/install-machine-watcher.sh idc-vm
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.herdr.focus-notify.watch.idc-vm.plist
+```
+
+The script writes a LaunchAgent that runs `target/release/herdr-focus-notify --watch-machine idc-vm`, restarts it if it exits, and logs to `~/Library/Logs/herdr-focus-notify/watch-idc-vm.log`. After a rebuild, restart it with `launchctl kickstart -k gui/$(id -u)/local.herdr.focus-notify.watch.idc-vm`. To remove it, run `launchctl bootout gui/$(id -u)/local.herdr.focus-notify.watch.idc-vm`, then `scripts/install-machine-watcher.sh idc-vm --remove`.
+
+Every 3 seconds (`--interval <secs>` changes this), the watcher runs `herdr --machine idc-vm agent list` and notifies when an agent turns `blocked` or `done`. The machine's server counts its focused pane as seen, so a turn that ends there goes to `idle` instead of `done`, even while the client shows another machine; the watcher notifies an `idle` reached through `working` as `done` too. Agents already blocked or done when the watcher starts do not notify. While the machine cannot be reached, the watcher logs once and keeps trying; a change made in the meantime notifies once the machine answers again.
+
+The notification looks like a local one, with the machine next to the agent in the subtitle: `claude @ idc-vm`. Clicking it brings forward the terminal Herdr runs in (Ghostty's quick terminal included), then focuses the pane on the machine with `herdr --machine idc-vm agent focus`.
+
+Limits:
+
+- A change shows up to one interval late, plus the SSH round trip.
+- Herdr has no command to switch the client to another machine. If Herdr shows Local when you click, select the machine in Herdr; the pane is already focused there.
+- Remote notifications are always sent, even when you are looking at the pane, because the plugin cannot tell which machine the client shows. Nothing removes them automatically while you look at the pane.
+- There is no Claude Code turn summary, git state, or workspace and tab label: those come from files and commands on the machine.
+
 ## Troubleshooting
 
 | Problem | What to check |
@@ -112,6 +138,7 @@ The `--test` action sends a real test notification (capped at 10 seconds) so you
 | A workspace has a stale terminal binding | Use the **Clear saved terminal bindings** plugin action, then focus a pane once in the expected terminal. |
 | Notifications appear while you are viewing Herdr | You were not in the workspace's bound terminal at that moment; the plugin errs on the side of notifying rather than missing a state change. |
 | Need diagnostic information | Run the plugin with `--test` or `--check-pane-visibility <pane_id>` to exercise the pipeline and focus checks directly. |
+| No notification from a remote machine | Read `~/Library/Logs/herdr-focus-notify/watch-<label>.log`, and run `herdr machine status <label>` to see whether the machine answers. |
 
 ## Bundled icons
 

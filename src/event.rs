@@ -12,16 +12,41 @@ struct PluginEvent {
     data: Option<EventData>,
 }
 
-#[derive(Debug, Deserialize)]
-struct EventData {
+/// The pane fields of a status-change event. An `agent list` entry names them
+/// the same way, so a remote pane is read with this too.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct EventData {
     pane_id: Option<String>,
     agent_status: Option<String>,
-    agent: Option<String>,
+    pub(crate) agent: Option<String>,
     display_agent: Option<String>,
     /// The pane's terminal title: what that agent or shell is working on.
     title: Option<String>,
     /// Labels Herdr reports per status, e.g. `{"blocked": "Needs an answer"}`.
     state_labels: Option<BTreeMap<String, String>>,
+}
+
+impl EventData {
+    pub(crate) fn pane_id(&self) -> Option<&str> {
+        trimmed(self.pane_id.as_deref())
+    }
+
+    /// The agent status, lowercased: `blocked`, `done`, `working`, ...
+    pub(crate) fn status(&self) -> String {
+        self.agent_status
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    /// The same pane with another status.
+    pub(crate) fn with_status(&self, status: &str) -> Self {
+        Self {
+            agent_status: Some(status.to_string()),
+            ..self.clone()
+        }
+    }
 }
 
 /// The agent statuses worth notifying about. `blocked` and `done` are the
@@ -35,26 +60,21 @@ pub(crate) fn notification_from_event_json(
 ) -> Result<Option<FocusNotification>, String> {
     let event: PluginEvent =
         serde_json::from_str(json).map_err(|err| format!("invalid event json: {err}"))?;
-    let Some(data) = event.data else {
-        return Ok(None);
-    };
+    Ok(event.data.as_ref().and_then(notification_from_event_data))
+}
 
-    let status = data
-        .agent_status
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
+/// The notification for a pane that turned `blocked` or `done`; None for any
+/// other status, or a pane without an id.
+pub(crate) fn notification_from_event_data(data: &EventData) -> Option<FocusNotification> {
+    let status = data.status();
 
     // Only blocked and done need user action, so they are the only statuses
     // that notify.
     if !status_is_enabled(&status) {
-        return Ok(None);
+        return None;
     }
 
-    let Some(pane_id) = pane_id_from_event_data(&data) else {
-        return Ok(None);
-    };
+    let pane_id = data.pane_id()?.to_string();
 
     let agent = first_non_empty([data.display_agent.as_deref(), data.agent.as_deref()])
         .unwrap_or("Agent")
@@ -80,7 +100,7 @@ pub(crate) fn notification_from_event_json(
     let body = detail.unwrap_or(fallback_body(&status)).to_string();
     let group = notification_group_id(&pane_id);
 
-    Ok(Some(FocusNotification {
+    Some(FocusNotification {
         pane_id,
         status,
         title: title.to_string(),
@@ -89,7 +109,8 @@ pub(crate) fn notification_from_event_json(
         group,
         app_icon,
         sender: None,
-    }))
+        machine: None,
+    })
 }
 
 fn fallback_body(status: &str) -> &'static str {
@@ -104,11 +125,11 @@ pub(crate) fn focused_pane_id_from_event_json(json: &str) -> Result<Option<Strin
     let event: PluginEvent =
         serde_json::from_str(json).map_err(|err| format!("invalid event json: {err}"))?;
 
-    Ok(event.data.as_ref().and_then(pane_id_from_event_data))
-}
-
-fn pane_id_from_event_data(data: &EventData) -> Option<String> {
-    trimmed(data.pane_id.as_deref()).map(str::to_string)
+    Ok(event
+        .data
+        .as_ref()
+        .and_then(EventData::pane_id)
+        .map(str::to_string))
 }
 
 fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<&str> {

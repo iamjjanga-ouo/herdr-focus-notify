@@ -1004,6 +1004,238 @@ fn clear_terminal_bindings_removes_old_activation_commands() {
 }
 
 #[cfg(unix)]
+#[test]
+fn machine_watcher_notifies_once_a_remote_agent_turns_blocked() {
+    let temp_dir = temp_test_dir();
+    let state_dir = temp_dir.join("state");
+    let herdr_log = temp_dir.join("herdr.log");
+    let poll_count = temp_dir.join("polls");
+    let notifier_log = temp_dir.join("notifier.log");
+
+    // `agent list` on the machine answers a baseline, then fails once, then
+    // reports w1:p1 blocked from then on. w1:p2 is `done` all along.
+    write_executable(
+        &temp_dir.join("herdr"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HERDR_LOG"
+[ "$*" = "--machine idc-vm agent list" ] || exit 0
+n=$(( $(cat "$POLL_COUNT" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$POLL_COUNT"
+case $n in
+  1) status=working seq=1 ;;
+  2) exit 1 ;;
+  *) status=blocked seq=2 ;;
+esac
+printf '{"result":{"agents":[{"agent":"claude","agent_status":"%s","state_change_seq":%s,"focused":true,"pane_id":"w1:p1","terminal_title_stripped":"Fix the parser"},{"agent":"codex","agent_status":"done","state_change_seq":7,"pane_id":"w1:p2"}]}}\n' "$status" "$seq"
+"#,
+    );
+    write_executable(
+        &temp_dir.join("alerter"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$NOTIFIER_LOG\"\n",
+    );
+
+    let mut watcher = binary()
+        .args(["--watch-machine", "idc-vm", "--interval", "0.1"])
+        .env("HERDR_BIN_PATH", temp_dir.join("herdr"))
+        .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
+        .env("HERDR_LOG", &herdr_log)
+        .env("POLL_COUNT", &poll_count)
+        .env("NOTIFIER_LOG", &notifier_log)
+        .env("HOME", &temp_dir)
+        .env("PATH", path_with_temp_dir(&temp_dir))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Several polls after the change, so a repeated notification would show.
+    let polls = || {
+        fs::read_to_string(&poll_count)
+            .ok()
+            .and_then(|count| count.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    for _ in 0..1000 {
+        if polls() >= 6 && notifier_log.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    watcher.kill().unwrap();
+    let output = watcher.wait_with_output().unwrap();
+    wait_for_detached_notifier(&state_dir);
+
+    let notifier_output = fs::read_to_string(&notifier_log).unwrap_or_default();
+    assert_eq!(
+        notifier_output.matches("--title=").count(),
+        1,
+        "{notifier_output}"
+    );
+    assert!(notifier_output.contains("--title=✋ [claude] - Fix the parser\n"));
+    assert!(notifier_output.contains("--subtitle=claude @ idc-vm\n"));
+    assert!(notifier_output.contains("--group\nherdr-machine-idc-vm-w1-p1\n"));
+    assert!(notifier_output.contains("/icons/claude-color.png\n"));
+
+    // The click focuses the pane on its machine.
+    let scripts: Vec<String> = fs::read_dir(&state_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".sh"))
+        .map(|entry| fs::read_to_string(entry.path()).unwrap())
+        .collect();
+    assert_eq!(scripts.len(), 1);
+    assert!(scripts[0].contains("--focus-pane 'w1:p1' --machine 'idc-vm'\n"));
+
+    // Every machine call names the machine; nothing asked to focus.
+    let herdr_calls = fs::read_to_string(&herdr_log).unwrap();
+    assert!(herdr_calls.contains("--machine idc-vm agent list\n"));
+    assert!(!herdr_calls.contains("focus"));
+
+    // The failed poll is logged, and so is the recovery.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("cannot list the agents of machine idc-vm")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("machine idc-vm answers again"), "{stderr}");
+    // A poll the kill interrupted may still be writing its logs.
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_focus_click_shows_the_herdr_terminal_and_focuses_on_the_machine() {
+    let temp_dir = temp_test_dir();
+    let state_dir = temp_dir.join("state");
+    let herdr_log = temp_dir.join("herdr.log");
+    let open_log = temp_dir.join("open.log");
+    // A local workspace's binding: the remote workspace has none of its own.
+    write_terminal_binding(&state_dir, "w1", "com.example.terminal");
+    write_executable(
+        &temp_dir.join("herdr"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\n[ -z \"$HERDR_FAIL\" ] || exit 1\necho '{\"result\":{}}'\n",
+    );
+    write_executable(
+        &temp_dir.join("open"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$OPEN_LOG\"\n",
+    );
+    let click = |fail: &str| {
+        binary()
+            .args(["--focus-pane", "w9:p3", "--machine", "idc-vm"])
+            .env("HERDR_BIN_PATH", temp_dir.join("herdr"))
+            .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
+            .env("HERDR_LOG", &herdr_log)
+            .env("HERDR_FAIL", fail)
+            .env("OPEN_LOG", &open_log)
+            .env_remove("HERDR_SOCKET_PATH")
+            .env("PATH", path_with_temp_dir(&temp_dir))
+            .output()
+            .unwrap()
+    };
+
+    let output = click("");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&open_log).unwrap(),
+        "-b com.example.terminal\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&herdr_log).unwrap(),
+        "--machine idc-vm agent focus w9:p3\n"
+    );
+    // The focus event fires on the machine, so no local marker is needed.
+    assert!(!state_dir.join("focus-origin-w9.marker").exists());
+
+    let output = click("1");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to focus w9:p3 on machine idc-vm")
+    );
+    fs::remove_dir_all(temp_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn machine_watcher_install_script_writes_and_removes_the_launch_agent() {
+    let temp_dir = temp_test_dir();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let install = |args: &[&str]| {
+        Command::new("sh")
+            .arg(repo.join("scripts/install-machine-watcher.sh"))
+            .args(args)
+            .env("HOME", &temp_dir)
+            .env_remove("HERDR_PLUGIN_STATE_DIR")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("HERDR_BIN_PATH")
+            .output()
+            .unwrap()
+    };
+    let plist_path =
+        temp_dir.join("Library/LaunchAgents/local.herdr.focus-notify.watch.idc-vm.plist");
+
+    let output = install(&["idc-vm"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plist = fs::read_to_string(&plist_path).unwrap();
+    for expected in [
+        format!(
+            "<string>{}</string>",
+            repo.join("target/release/herdr-focus-notify").display()
+        ),
+        "<string>--watch-machine</string>\n    <string>idc-vm</string>".to_string(),
+        "<key>KeepAlive</key><true/>".to_string(),
+        format!(
+            "<key>PATH</key><string>{}/.local/bin:/opt/homebrew/bin:",
+            temp_dir.display()
+        ),
+        format!(
+            "<string>{}/.local/state/herdr/plugins/herdr-focus-notify</string>",
+            temp_dir.display()
+        ),
+        format!(
+            "<key>StandardErrorPath</key><string>{}/Library/Logs/herdr-focus-notify/watch-idc-vm.log</string>",
+            temp_dir.display()
+        ),
+    ] {
+        assert!(plist.contains(&expected), "{expected}\n{plist}");
+    }
+    assert!(!plist.contains("HERDR_BIN_PATH"));
+    // Loading it is left to the user.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "launchctl bootstrap gui/{} {}",
+            String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
+                .unwrap()
+                .trim(),
+            plist_path.display()
+        )),
+        "{stdout}"
+    );
+
+    // A label that cannot name a launchd job or a file is refused.
+    assert!(!install(&["idc vm"]).status.success());
+    assert!(!install(&["../vm"]).status.success());
+
+    let output = install(&["idc-vm", "--remove"]);
+    assert!(output.status.success());
+    assert!(!plist_path.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("launchctl bootout gui/"));
+    fs::remove_dir_all(temp_dir).unwrap();
+}
+
+#[cfg(unix)]
 fn write_terminal_binding(state_dir: &Path, workspace: &str, bundle_id: &str) {
     fs::create_dir_all(state_dir).unwrap();
     fs::write(

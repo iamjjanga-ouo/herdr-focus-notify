@@ -23,7 +23,7 @@ struct Envelope<T> {
 
 /// The result inside a Herdr CLI reply. None for a reply that cannot be read:
 /// every caller treats that like a Herdr that did not answer.
-fn herdr_result<T: DeserializeOwned>(json: &str) -> Option<T> {
+pub(crate) fn herdr_result<T: DeserializeOwned>(json: &str) -> Option<T> {
     serde_json::from_str::<Envelope<T>>(json).ok()?.result
 }
 
@@ -108,6 +108,7 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
         group: format!("herdr-{}", sanitize_group_id(&pane_id)),
         app_icon: None,
         sender: None,
+        machine: None,
     }
 }
 
@@ -303,20 +304,8 @@ pub(crate) fn focus_pane(pane_id: &str) -> Result<(), String> {
     crate::state::mark_focus_origin(workspace)
         .map_err(|err| format!("failed to mark notification focus: {err}"))?;
     let result = (|| -> Result<(), String> {
-        // Select the terminal container showing Herdr before activating the
-        // terminal, so it brings that container forward. Terminals without an
-        // adapter, or any failure, keep plain app activation.
         let socket_path = env::var("HERDR_SOCKET_PATH").ok();
-        // Ghostty's quick terminal is activated on its own, and `open -b`
-        // runs only when there is none: it would open a new window.
-        let open_terminal = bound_terminal != crate::terminal::GHOSTTY_BUNDLE_ID
-            || crate::terminal::raise_quick_terminal() == crate::terminal::QuickTerminal::Absent;
-        if open_terminal {
-            if let Some(socket_path) = &socket_path {
-                let _ = crate::terminal::raise_client_container(&bound_terminal, socket_path);
-            }
-            activate_terminal(&bound_terminal)?;
-        }
+        show_terminal(&bound_terminal, socket_path.as_deref())?;
         let socket_path = socket_path.ok_or("HERDR_SOCKET_PATH is unavailable")?;
         focus_pane_via_socket(pane_id, &socket_path)
     })();
@@ -326,6 +315,24 @@ pub(crate) fn focus_pane(pane_id: &str) -> Result<(), String> {
     }
 
     result
+}
+
+/// Brings `bound_terminal`, the terminal running Herdr, forward for a click.
+pub(crate) fn show_terminal(bound_terminal: &str, socket_path: Option<&str>) -> Result<(), String> {
+    // Ghostty's quick terminal is activated on its own, and `open -b`
+    // runs only when there is none: it would open a new window.
+    let open_terminal = bound_terminal != crate::terminal::GHOSTTY_BUNDLE_ID
+        || crate::terminal::raise_quick_terminal() == crate::terminal::QuickTerminal::Absent;
+    if open_terminal {
+        // Select the terminal container showing Herdr before activating the
+        // terminal, so it brings that container forward. Terminals without an
+        // adapter, or any failure, keep plain app activation.
+        if let Some(socket_path) = socket_path {
+            let _ = crate::terminal::raise_client_container(bound_terminal, socket_path);
+        }
+        activate_terminal(bound_terminal)?;
+    }
+    Ok(())
 }
 
 fn focus_pane_via_socket(pane_id: &str, socket_path: &str) -> Result<(), String> {

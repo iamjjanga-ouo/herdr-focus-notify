@@ -38,7 +38,7 @@ pub(crate) fn write_focus_script(
     };
 
     let mut hasher = DefaultHasher::new();
-    notification.pane_id.hash(&mut hasher);
+    notification.state_key().hash(&mut hasher);
 
     let script_path = state_dir.join(format!("focus-{:016x}.sh", hasher.finish()));
     let executable_path = env::current_exe()?;
@@ -115,7 +115,7 @@ fn alerter_focus_script(
     let herdr_q = shell_quote(herdr_bin);
     let focus_binary_q = shell_quote(&focus_binary.to_string_lossy());
     let notifier_q = shell_quote(notifier_bin);
-    let cleared_marker = cleared_notification_marker_path(&notification.pane_id);
+    let cleared_marker = cleared_notification_marker_path(&notification.state_key());
     let cleared_marker_q = shell_quote(cleared_marker.to_string_lossy().as_ref());
     let app_icon_args = notification
         .app_icon
@@ -146,6 +146,13 @@ fn alerter_focus_script(
             pane_q
         )
     });
+    // A remote pane is focused through its machine: its id means nothing to
+    // the local server.
+    let machine_args = notification
+        .machine
+        .as_ref()
+        .map(|machine| format!(" --machine {}", shell_quote(machine)))
+        .unwrap_or_default();
     let result_template_q = shell_quote(&format!("{}.result.XXXXXX", cleared_marker.display()));
     let status_template_q = shell_quote(&format!("{}.status.XXXXXX", cleared_marker.display()));
 
@@ -191,10 +198,11 @@ fn alerter_focus_script(
     script.push_str("fi\n");
     script.push_str("case \"$result\" in\n");
     script.push_str(&format!(
-        "  Focus|@ACTIONCLICKED|@CONTENTCLICKED)\n    HERDR_BIN_PATH={herdr} exec {focus_binary} --focus-pane {pane}\n    ;;\n",
+        "  Focus|@ACTIONCLICKED|@CONTENTCLICKED)\n    HERDR_BIN_PATH={herdr} exec {focus_binary} --focus-pane {pane}{machine_args}\n    ;;\n",
         herdr = herdr_q,
         focus_binary = focus_binary_q,
         pane = pane_q,
+        machine_args = machine_args,
     ));
     script.push_str("esac\n");
 
@@ -276,6 +284,7 @@ mod tests {
             group: "herdr-w1-p3".to_string(),
             app_icon: Some("/tmp/codex icon.png".to_string()),
             sender: None,
+            machine: None,
         }
     }
 
@@ -422,6 +431,30 @@ mod tests {
 
         assert!(!script.contains("open -b "));
         assert!(script.contains("HERDR_BIN_PATH='/usr/local/bin/herdr' exec '/tmp/herdr-focus-notify' --focus-pane 'w1:p3'"));
+    }
+
+    #[test]
+    fn alerter_script_focuses_a_remote_pane_through_its_machine() {
+        let notification = FocusNotification {
+            machine: Some("idc-vm".to_string()),
+            group: "herdr-machine-idc-vm-w1-p3".to_string(),
+            ..sample_notification()
+        };
+        let script = alerter_focus_script(
+            &notification,
+            "/usr/local/bin/herdr",
+            "/opt/homebrew/bin/alerter",
+            3600,
+            None,
+            Path::new("/tmp/herdr-focus-notify"),
+        );
+
+        assert!(script
+            .contains("exec '/tmp/herdr-focus-notify' --focus-pane 'w1:p3' --machine 'idc-vm'\n"));
+        assert!(script.contains("--group 'herdr-machine-idc-vm-w1-p3'"));
+        // The local pane `w1:p3` has a cleared marker of its own.
+        assert!(script.contains("/herdr-machine-idc-vm-w1-p3.cleared' ] && exit 0"));
+        assert!(!script.contains("--check-pane-visibility"));
     }
 
     #[test]
