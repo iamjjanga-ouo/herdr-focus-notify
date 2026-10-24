@@ -91,8 +91,9 @@ struct Watcher {
 impl Watcher {
     /// The panes to notify about after a poll: those that are `blocked` or
     /// `done` with a state the last good poll did not see, including a pane it
-    /// did not see at all. A `None` poll failed and changes nothing, so the
-    /// next good poll is compared with the last good one.
+    /// did not see at all, and those whose turn ended in `idle` (see
+    /// `notice()`), reported as `done`. A `None` poll failed and changes
+    /// nothing, so the next good poll is compared with the last good one.
     fn on_poll(&mut self, machine: &str, panes: Option<Vec<RemotePane>>) -> Vec<RemotePane> {
         let Some(panes) = panes else {
             if !std::mem::replace(&mut self.failing, true) {
@@ -117,14 +118,35 @@ impl Watcher {
         };
         panes
             .into_iter()
-            .filter(|pane| {
-                let state = pane.state();
-                pane.event.pane_id().is_some_and(|pane_id| {
-                    status_is_enabled(&state.1) && last.get(pane_id) != Some(&state)
-                })
+            .filter_map(|mut pane| {
+                let finished_turn = notice(last.get(pane.event.pane_id()?), &pane.state())?;
+                if finished_turn {
+                    pane.event = pane.event.with_status("done");
+                }
+                Some(pane)
             })
             .collect()
     }
+}
+
+/// Whether a pane's new state notifies: `Some(false)` as it is, `Some(true)`
+/// as a finished turn, `None` not at all.
+///
+/// A machine's server counts its focused pane as seen, so a turn that ends
+/// there goes to `idle`, not `done`, even while the Herdr client shows another
+/// machine. So an `idle` reached from `working`, or after two or more status
+/// changes since the last poll, is a finished turn. One reached from `done` was
+/// seen, and one reached from `blocked` in a single change is a question that
+/// was answered or dismissed without a turn.
+fn notice(last: Option<&PaneState>, now: &PaneState) -> Option<bool> {
+    if status_is_enabled(&now.1) {
+        return (last != Some(now)).then_some(false);
+    }
+    let (last_seq, last_status) = last?;
+    let finished_turn = now.1 == "idle"
+        && last_status != "done"
+        && (last_status == "working" || now.0 >= last_seq + 2);
+    finished_turn.then_some(true)
 }
 
 /// Sends the notification for a remote pane. It is never skipped: the plugin
@@ -277,6 +299,43 @@ mod tests {
             ids(&watcher.on_poll("vm", Some(vec![pane("w1:p1", "done", 4)]))),
             ["w1:p1"]
         );
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_idle_notifies_as_done() {
+        let mut watcher = Watcher::default();
+        watcher.on_poll(
+            "vm",
+            Some(vec![
+                pane("w1:p1", "working", 5),
+                pane("w1:p2", "idle", 4),
+                pane("w1:p3", "blocked", 3),
+                pane("w1:p4", "done", 5),
+            ]),
+        );
+
+        let changed = watcher.on_poll(
+            "vm",
+            Some(vec![
+                // The turn ended on the server's focused pane.
+                pane("w1:p1", "idle", 6),
+                // A whole turn between two polls.
+                pane("w1:p2", "idle", 6),
+                // The question was dismissed without a turn.
+                pane("w1:p3", "idle", 4),
+                // Seen after it was done.
+                pane("w1:p4", "idle", 6),
+            ]),
+        );
+
+        assert_eq!(ids(&changed), ["w1:p1", "w1:p2"]);
+        assert!(changed.iter().all(|pane| pane.event.status() == "done"));
+        let notification = remote_notification("vm", &changed[0]).unwrap();
+        assert_eq!(notification.body, "Open the pane to review the result.");
+        // Nothing new happened since.
+        assert!(watcher
+            .on_poll("vm", Some(vec![pane("w1:p1", "idle", 6)]))
+            .is_empty());
     }
 
     #[test]

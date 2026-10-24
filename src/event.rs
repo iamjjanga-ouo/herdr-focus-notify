@@ -14,7 +14,7 @@ struct PluginEvent {
 
 /// The pane fields of a status-change event. An `agent list` entry names them
 /// the same way, so a remote pane is read with this too.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct EventData {
     pane_id: Option<String>,
     agent_status: Option<String>,
@@ -38,6 +38,14 @@ impl EventData {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
+    }
+
+    /// The same pane with another status.
+    pub(crate) fn with_status(&self, status: &str) -> Self {
+        Self {
+            agent_status: Some(status.to_string()),
+            ..self.clone()
+        }
     }
 }
 
