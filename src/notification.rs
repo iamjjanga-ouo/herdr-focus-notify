@@ -12,6 +12,22 @@ pub(crate) struct FocusNotification {
     /// Bundle id alerter shows the notification as coming from; `None` keeps
     /// alerter's default, Terminal.
     pub(crate) sender: Option<String>,
+    /// The saved SSH machine (`herdr machine add`) whose server hosts the pane;
+    /// `None` for a pane of the local server.
+    pub(crate) machine: Option<String>,
+}
+
+impl FocusNotification {
+    /// What the notification's state files and alerter group are keyed by.
+    /// Pane ids are per server, so a local pane and a remote one can both be
+    /// `w1:p1`: a remote pane's key names its machine, and a local pane's is
+    /// its id, as it always was.
+    pub(crate) fn state_key(&self) -> String {
+        match &self.machine {
+            Some(machine) => format!("machine-{machine}:{}", self.pane_id),
+            None => self.pane_id.clone(),
+        }
+    }
 }
 
 /// What Herdr and git add to a notification about its pane, beyond the event's

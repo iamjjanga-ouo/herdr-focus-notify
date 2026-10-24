@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::executable::{find_executable, home_dir};
+use crate::notification::FocusNotification;
+use crate::script::write_focus_script;
+use crate::state::reset_notification_clearance;
 use crate::util::{notification_group_id, shell_quote};
 
 pub(crate) fn resolve_notifier_bin() -> Result<String, String> {
@@ -24,7 +27,32 @@ pub(crate) fn herdr_sender() -> Option<String> {
     app.is_dir().then(|| HERDR_APP_BUNDLE_ID.to_string())
 }
 
-pub(crate) fn send_notification(script_path: &Path, foreground: bool) -> io::Result<()> {
+/// Writes the notification's focus script and runs it: detached, or in the
+/// foreground for `--test` so a notifier failure surfaces.
+pub(crate) fn deliver_notification(
+    notification: &FocusNotification,
+    herdr_bin: &str,
+    notifier_bin: &str,
+    monitor_visibility: bool,
+    test_mode: bool,
+) -> Result<(), String> {
+    reset_notification_clearance(&notification.state_key())
+        .map_err(|err| format!("failed to reset notification clearance: {err}"))?;
+
+    let script_path = write_focus_script(
+        notification,
+        herdr_bin,
+        notifier_bin,
+        monitor_visibility,
+        test_mode,
+    )
+    .map_err(|err| format!("failed to write focus script: {err}"))?;
+
+    send_notification(&script_path, test_mode)
+        .map_err(|err| format!("failed to send notification: {err}"))
+}
+
+fn send_notification(script_path: &Path, foreground: bool) -> io::Result<()> {
     if foreground {
         run_script_foreground(script_path)
     } else {
@@ -77,13 +105,16 @@ fn spawn_detached_script(script_path: &Path) -> io::Result<()> {
         shell_quote(script_str.as_ref())
     );
 
+    // `sh -c` exits as soon as the script is in the background; waiting for
+    // it reaps it, which a long-running `--watch-machine` needs, as it would
+    // otherwise keep one zombie per notification.
     Command::new("sh")
         .arg("-c")
         .arg(&cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .status()
         .map(|_| ())
 }
 

@@ -28,6 +28,7 @@ CI runs on `macos-latest` and executes all of the above in order (see [`.github/
 ├── src/main.rs         # Thin CLI/plugin entry point
 ├── src/*.rs            # Focused modules for CLI, config, event parsing, focus checks, git summaries, scripts, and notifier delivery
 ├── assets/icons        # Bundled local agent icons used by alerter --app-icon
+├── scripts/            # install-herdr-app.sh (stub sender app), install-machine-watcher.sh (LaunchAgent for --watch-machine)
 ├── tests/cli_test.rs   # Process-level CLI contract tests
 ├── README.md           # English documentation
 └── README.zh-CN.md     # Chinese documentation
@@ -42,6 +43,7 @@ There are no submodules, no external crates beyond serde/serde_json, and no buil
    - In normal mode, the binary reads the Herdr event from the `HERDR_PLUGIN_EVENT_JSON` environment variable.
    - In test mode (`--test` CLI arg), it fabricates a notification for the currently focused pane. When the plugin is enabled, test mode always sends: it bypasses the status filter and downgrades a `Skip` focus decision to a plain send (no visibility monitor), so the action can validate the pipeline even in a fully configured setup.
    - `--help` and `--version` print to stdout before plugin setup.
+   - `--watch-machine <label> [--interval <secs>]` is a long-running poller for a saved SSH machine, outside Herdr's plugin hooks; see **Remote machines** below.
 3. **Notification decision**:
    - Only `blocked` and `done` statuses can produce notifications (they are the ones that need user action). There is no configuration to change this set.
    - The decision is one of `Skip`, `Send`, or `SendWithVisibilityMonitor`: `Skip` only when the target pane is focused **and** the frontmost macOS app matches the terminal bound to the pane's workspace (learned from `pane.focused` events); `SendWithVisibilityMonitor` when the pane is focused but the frontmost app differs from the bound terminal, so the notification auto-dismisses once the pane is seen; plain `Send` otherwise (including when the frontmost app or the binding is unknown), to avoid missing a state change.
@@ -54,11 +56,18 @@ There are no submodules, no external crates beyond serde/serde_json, and no buil
    - The notifier backend is resolved from `PATH`, then hard-coded candidates for `alerter` (e.g. Homebrew paths).
 5. **Focus script generation**:
    - A shell script is written to `HERDR_PLUGIN_STATE_DIR` (falling back to `$TMPDIR/herdr-focus-notify`).
-   - The script name is a hash of the pane ID, so repeated events for one pane reuse the same script path. Old generated scripts and crashed notifier temp files are cleaned up opportunistically.
+   - The script name is a hash of the notification's `state_key()` (the pane ID, or `machine-<label>:<pane ID>` for a remote pane), so repeated events for one pane reuse the same script path. Old generated scripts and crashed notifier temp files are cleaned up opportunistically.
    - The script is made executable with mode `0o700`.
 6. **Notification delivery**:
    - Normal plugin events spawn the script detached via `nohup sh ... &`. The script itself calls `alerter`, then invokes the binary's internal `--focus-pane` action if the user clicks the notification. That action re-reads the current workspace binding, activates it with `open -b <bound bundle id>` (for terminals with an adapter in `src/terminal/`, currently kitty and iTerm2, first selecting the container of a Herdr client attached to the session: kitty via `kitten @ focus-window`, iTerm2 via its `iterm2:reveal?sessionid=` URL; see `src/terminal/mod.rs` to add a terminal; Ghostty with no regular window is taken to run Herdr in its quick terminal, which `src/terminal/ghostty.rs` shows if hidden and activates instead of `open -b`, as `open -b` would open a new window), marks the operation as plugin-originated, and sends Herdr's raw `pane.focus` socket request to display the target workspace, tab, and pane atomically. This works for both agent and ordinary shell panes. With no binding, the action exits without activating an app or invoking Herdr.
    - `--test` runs the generated script in the foreground so notifier failures surface through stderr and a non-zero exit code.
+   - `deliver_notification()` in `src/notifier.rs` resets the cleared marker, writes the script, and runs it; the event path and the watcher both use it.
+7. **Remote machines** (`src/machine.rs`):
+   - Herdr runs plugin hooks on the server that hosts the panes, so a saved SSH machine's agents never reach this plugin. `--watch-machine <label>` polls `herdr --machine <label> agent list` every `--interval` seconds (default 3), with a 10-second timeout per call; nothing is installed on the machine. `scripts/install-machine-watcher.sh <label> [--remove]` writes (or deletes) `~/Library/LaunchAgents/local.herdr.focus-notify.watch.<label>.plist` (KeepAlive, a PATH with `~/.local/bin` and `/opt/homebrew/bin`, the plugin's `HERDR_PLUGIN_STATE_DIR` so it shares the terminal bindings, a log under `~/Library/Logs/herdr-focus-notify/`) and only prints the `launchctl` command.
+   - `Watcher` keeps each pane's `(state_change_seq, agent_status)` from the last good poll. The first good poll is the baseline and notifies nothing. After that, a pane notifies when it is `blocked` or `done` with a state the last good poll did not have, including a pane that poll did not list; panes that disappear are forgotten. A failed poll changes nothing; a run of failures is logged once, and so is the recovery.
+   - An `agent list` entry uses the event's field names, so `RemotePane` flattens `EventData` and goes through `notification_from_event_data()` and `enrich_notification()` with only the terminal title and the agent. The transcript summary, git state, and workspace and tab labels are left out, as they live on the machine. The subtitle becomes `<agent> @ <label>`. `machine` on `FocusNotification` makes `state_key()`, and with it the alerter group (`herdr-machine-<label>-<pane>`), the cleared marker, and the script name, distinct from a local pane with the same ID.
+   - Remote notifications are never skipped and get no visibility monitor: the remote server always calls one of its panes focused, and the plugin cannot tell which machine the client shows.
+   - A click runs `--focus-pane <pane> --machine <label>`. `show_terminal()`, shared with the local click, brings forward the terminal most local workspaces are bound to (`state::herdr_terminal()`), Ghostty's quick terminal included; then `herdr --machine <label> agent focus <pane>` focuses the pane on its server. Herdr has no command that switches the client's active machine.
 
 ## Configuration
 
@@ -83,19 +92,19 @@ Bundled agent icons are extracted from `@lobehub/icons-static-png` (except `omp.
 - **Option-heavy parsing**: Event and CLI JSON fields are mostly optional; the code uses `Option<T>` everywhere and falls back to defaults or skips silently.
 - **Shell quoting**: `shell_quote()` wraps values in single quotes and escapes embedded single quotes with `'\''`.
 - **Platform gating**: `#[cfg(unix)]` guards executable-bit checks and `make_executable`; other platforms compile but behave differently.
-- **No logging crate**: The production code writes no debug logs; errors go to stderr and a non-zero exit code.
+- **No logging crate**: The production code writes no debug logs; errors go to stderr and a non-zero exit code. The `--watch-machine` loop also reports its start, unreachable-machine runs, and delivery failures on stderr, which launchd writes to its log file.
 
 ## Testing
 
 - Unit tests are inline under each module's `#[cfg(test)] mod tests`; process-level CLI behavior lives under `tests/`.
 - Run with `cargo test`.
 - Tests cover JSON parsing, notification body construction, shell quoting, focus script generation, and skip logic.
-- Some runtime behavior (the real `lsappinfo` frontmost-app lookup, actual alerter invocation, `herdr agent get`, and the test-mode `herdr pane list`) cannot be exercised in CI and is only validated manually on macOS.
+- Some runtime behavior (the real `lsappinfo` frontmost-app lookup, actual alerter invocation, `herdr agent get`, the test-mode `herdr pane list`, `herdr --machine` polling and `agent focus` against a real machine, and loading the LaunchAgent) cannot be exercised in CI and is only validated manually on macOS. The watcher's process test fakes `herdr` with a script that answers `agent list` differently on each poll.
 
 ## Important Gotchas
 
 - **macOS only**: The plugin manifest declares `platforms = ["macos"]`. The binary shells out to macOS-only tools (`lsappinfo` for the frontmost app, `open -b` for terminal activation, `alerter` for delivery); it will not behave correctly on other platforms.
 - **No-event quiet path**: A normal plugin invocation without `HERDR_PLUGIN_EVENT_JSON` exits quietly with `0`. Real parsing, script, and notifier errors should surface through stderr and non-zero exit codes.
 - **Skip logic is conservative**: A notification is only suppressed when the plugin can *confirm* the pane is focused and the frontmost app is the terminal bound to the pane's workspace. Any ambiguity (a failed `lsappinfo` lookup, an unknown frontmost app, a missing binding) results in a notification being sent. The learned-terminal file lives in the state directory as `terminal-memory.json` and is deliberately excluded from the stale-file sweep. Obvious non-terminal bundle IDs are treated as unbound when read.
-- **State directory hygiene**: Generated scripts are keyed by a hash of the pane ID, so repeated events for one pane reuse the same script path. A retention sweep removes stale generated scripts (30 days), focus-origin markers (15 seconds), crashed notifier temp files (24 hours), and `.cleared` focus markers (24 hours); it runs on `--cleanup` (including the Herdr startup hook) and opportunistically before each notification. Cleanup and the clear-bindings action also remove the old captured `open -b` line from scripts generated by earlier versions.
+- **State directory hygiene**: Generated scripts are keyed by a hash of the notification's state key (the pane ID, prefixed with its machine for a remote pane), so repeated events for one pane reuse the same script path. A retention sweep removes stale generated scripts (30 days), focus-origin markers (15 seconds), crashed notifier temp files (24 hours), and `.cleared` focus markers (24 hours); it runs on `--cleanup` (including the Herdr startup hook) and opportunistically before each notification. Cleanup and the clear-bindings action also remove the old captured `open -b` line from scripts generated by earlier versions.
 - **`herdr-plugin.toml` is the source of truth for execution**: Herdr invokes `target/release/herdr-focus-notify` directly for events and actions, not `cargo run`. The binary must be built before the plugin action/event works.

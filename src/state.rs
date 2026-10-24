@@ -35,6 +35,27 @@ pub(crate) fn remembered_terminal(workspace: &str) -> Option<String> {
         .cloned()
 }
 
+/// The terminal running the Herdr client, for a pane on another machine:
+/// bindings are learned from local `pane.focused` events, so a remote
+/// workspace has none, and the terminal most local workspaces are bound to is
+/// the one that shows Herdr.
+pub(crate) fn herdr_terminal() -> Option<String> {
+    most_bound_terminal(&read_terminal_bindings_from(&terminal_memory_path())?)
+}
+
+fn most_bound_terminal(bindings: &std::collections::HashMap<String, String>) -> Option<String> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for bundle_id in bindings.values() {
+        if !is_obvious_non_terminal_bundle(bundle_id) {
+            *counts.entry(bundle_id).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(bundle_id, _)| bundle_id.to_string())
+}
+
 /// Clears all saved workspace-to-terminal bindings.
 pub(crate) fn clear_terminal_bindings() -> io::Result<()> {
     let binding_result = match fs::remove_file(terminal_memory_path()) {
@@ -363,5 +384,36 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_herdr_terminal_is_the_one_most_workspaces_are_bound_to() {
+        let bindings = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(workspace, bundle_id)| (workspace.to_string(), bundle_id.to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+
+        assert_eq!(
+            most_bound_terminal(&bindings(&[
+                ("w1", "com.mitchellh.ghostty"),
+                ("w2", "net.kovidgoyal.kitty"),
+                ("w3", "com.mitchellh.ghostty"),
+            ]))
+            .as_deref(),
+            Some("com.mitchellh.ghostty")
+        );
+        // A browser saved by an older version is no terminal.
+        assert_eq!(
+            most_bound_terminal(&bindings(&[
+                ("w1", "com.google.Chrome"),
+                ("w2", "com.google.Chrome"),
+                ("w3", "net.kovidgoyal.kitty"),
+            ]))
+            .as_deref(),
+            Some("net.kovidgoyal.kitty")
+        );
+        assert_eq!(most_bound_terminal(&bindings(&[])), None);
     }
 }

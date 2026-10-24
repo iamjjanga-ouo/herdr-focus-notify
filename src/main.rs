@@ -4,6 +4,7 @@ mod executable;
 mod focus;
 mod git;
 mod icons;
+mod machine;
 mod notification;
 mod notifier;
 mod script;
@@ -26,11 +27,11 @@ use focus::{
     frontmost_bundle_id, learn_terminal_from_frontmost, notification_decision, pane_details,
     pane_labels, should_clear_notification_on_focus, test_notification, NotificationDecision,
 };
-use notifier::{herdr_sender, remove_notification, resolve_notifier_bin, send_notification};
-use script::{rewrite_generated_scripts_without_activation, write_focus_script};
+use notifier::{deliver_notification, herdr_sender, remove_notification, resolve_notifier_bin};
+use script::rewrite_generated_scripts_without_activation;
 use state::{
     cleanup_stale_state_files, clear_terminal_bindings, mark_notification_cleared,
-    prune_stale_workspace_bindings, reset_notification_clearance,
+    prune_stale_workspace_bindings,
 };
 
 /// Time the Herdr and git calls behind one notification get, together: the
@@ -83,6 +84,12 @@ fn run() -> Result<(), String> {
         }
         CliAction::FocusPane(pane_id) => {
             return focus::focus_pane(&pane_id);
+        }
+        CliAction::FocusMachinePane { machine, pane_id } => {
+            return machine::focus_pane(&machine, &pane_id);
+        }
+        CliAction::WatchMachine { machine, interval } => {
+            return machine::watch(&machine, interval);
         }
         CliAction::CheckPaneVisibility(pane_id) => {
             let herdr_bin = resolve_herdr_bin()?;
@@ -142,7 +149,9 @@ fn run() -> Result<(), String> {
         | CliAction::Cleanup
         | CliAction::ClearTerminalBindings
         | CliAction::CheckPaneVisibility(_)
-        | CliAction::FocusPane(_) => {
+        | CliAction::FocusPane(_)
+        | CliAction::FocusMachinePane { .. }
+        | CliAction::WatchMachine { .. } => {
             unreachable!("handled before notification setup")
         }
     };
@@ -184,20 +193,11 @@ fn run() -> Result<(), String> {
     }
     notification.sender = herdr_sender();
 
-    reset_notification_clearance(&notification.pane_id)
-        .map_err(|err| format!("failed to reset notification clearance: {err}"))?;
-
-    let script_path = write_focus_script(
+    deliver_notification(
         &notification,
         &herdr_bin,
         &notifier_bin,
         notification_decision == NotificationDecision::SendWithVisibilityMonitor,
         action == CliAction::Test,
     )
-    .map_err(|err| format!("failed to write focus script: {err}"))?;
-
-    send_notification(&script_path, action == CliAction::Test)
-        .map_err(|err| format!("failed to send notification: {err}"))?;
-
-    Ok(())
 }
